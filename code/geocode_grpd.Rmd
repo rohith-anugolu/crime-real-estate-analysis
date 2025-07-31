@@ -1,0 +1,140 @@
+---
+title: "Geocode GRPD"
+author: "Rohith Anugolu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(tidyverse)
+library(openxlsx)
+library(tidygeocoder)
+library(furrr)
+library(future)
+library(sf)
+```
+
+
+```{r}
+#read grpd.xlsx file
+df <- openxlsx::read.xlsx("Datasets/GRPDData.xlsx") 
+```
+
+
+```{r}
+# format address and remove any special characters or whitespaces
+df <- df %>%
+  filter(!is.na(BLOCK_ADDRESS__INCIDENT_LOCATIO)) %>%
+  mutate(
+    Address = str_remove_all(BLOCK_ADDRESS__INCIDENT_LOCATIO, "BLOCK"),
+    Address = str_trim(Address),
+    Address = str_squish(Address),
+    Address = paste0(Address, ", Grand Rapids, MI")
+  ) %>%
+  filter(Address != "", str_detect(Address, "^[\\w\\s&/.,-]+$"))  # keep only valid characters
+
+```
+
+```{r}
+# get unique addresses
+unique_addresses <- df %>%
+  distinct(Address)
+```
+
+
+```{r}
+# Use all available cores (or set to "multisession" if needed)
+plan(multisession, workers = parallel::detectCores() - 1)
+```
+
+
+```{r}
+# Custom function to geocode a chunk of addresses
+parallel_geocode <- function(df_chunk) {
+  geocode(df_chunk, address = Address, method = "arcgis", return_input = TRUE)
+}
+
+# Split into chunks of ~500
+chunks <- split(unique_addresses, ceiling(seq_along(1:nrow(unique_addresses)) / 500))
+
+# Apply geocoding in parallel
+results <- future_map(chunks, parallel_geocode, .progress = TRUE)
+
+# Combine results
+geocoded_all <- bind_rows(results)
+```
+
+
+```{r}
+final_df <- df %>%
+  left_join(geocoded_all, by = "Address")
+```
+
+
+```{r}
+# read shape file
+zillow_regions <- st_read("Datasets/City_of_Grand_Rapids_Neighborhood_Areas/City_of_Grand_Rapids_Neighborhood_Areas.shp")
+```
+
+
+```{r}
+grpd_clean <- final_df |>
+  dplyr::filter(!is.na(long), !is.na(lat)) |>
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+```
+
+```{r}
+zillow_regions <- st_transform(zillow_regions, crs = st_crs(grpd_clean))
+
+# Now perform the spatial join
+grpd_with_region <- st_join(grpd_clean, zillow_regions, join = st_within)
+```
+
+```{r}
+grpd_with_region <- grpd_with_region %>%
+  mutate(
+    long = st_coordinates(geometry)[, 1],
+    lat = st_coordinates(geometry)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  dplyr::select(lat, long, RegionName = NEBRH)
+```
+
+```{r}
+grpd_with_region <- grpd_with_region %>%
+  distinct(lat, long, .keep_all = TRUE)
+```
+
+
+```{r}
+# join final_df with region data
+final_df <- final_df %>%
+  left_join(grpd_with_region, by = c("lat", "long"))
+```
+
+```{r}
+# save this as grpd.xlsx which will be used further
+final_df <- final_df |>
+  dplyr::filter(
+    RegionName != "",
+    Service_Area != "Other Jurisdiction",
+    dplyr::between(lat, 42.85, 43.05),
+    dplyr::between(long, -85.75, -85.55)
+  ) |>
+  st_drop_geometry() |>
+  dplyr::select(-Address)
+
+openxlsx::write.xlsx(final_df, "Datasets/grpd.xlsx")
+```
+
+```{r}
+final_df |>
+  dplyr::select(Region) |>
+  distinct()
+```
